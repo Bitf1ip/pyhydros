@@ -1,3 +1,0 @@
-# Exclude sensitive files from Copilot
-.env
-.env.*
