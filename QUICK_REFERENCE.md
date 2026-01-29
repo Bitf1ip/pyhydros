@@ -98,7 +98,7 @@ client.mqtt_client.disconnect()               # Cleanly close connection when do
 
 ## Data Structures
 
-### Hydros MQTT Data (S3)
+### Hydros MQTT schemas
 ```python
 {
     "Input": {
