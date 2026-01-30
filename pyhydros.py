@@ -578,7 +578,7 @@ class HydrosAPI:
         Get sensor/thing information by ID.
         
         Args:
-            thing_id: The ID of the sensor/thing (e.g., '100G5faa8f66')
+            thing_id: The ID of the sensor/thing 
         
         Returns:
             Dict containing sensor/thing data
@@ -595,7 +595,7 @@ class HydrosAPI:
         Update sensor/thing configuration.
         
         Args:
-            thing_id: The ID of the sensor/thing (e.g., '100G5faa8f66')
+            thing_id: The ID of the sensor/thing
             data: Configuration data to update
         
         Returns:
@@ -693,7 +693,7 @@ class HydrosAPI:
         Args:
             mqtt_endpoint: Optional AWS IoT endpoint. If omitted, the method attempts to
                 extract an endpoint from Hydros API responses.
-            thing_id: Thing ID to get Cognito Identity Pool ID from (e.g., '100G5faa8f66')
+            thing_id: Thing ID to get Cognito Identity Pool ID from
             client_id: MQTT client ID
         
         Returns:
@@ -811,7 +811,7 @@ class HydrosAPI:
         Subscribe to real-time status updates for a sensor/thing.
         
         Args:
-            thing_id: The thing ID (e.g., '100G5faa8f66')
+            thing_id: The thing ID
             callback: Function to call when status update received (receives topic, payload_dict)
         """
         if not self.mqtt_client or not self.mqtt_client.connected:
