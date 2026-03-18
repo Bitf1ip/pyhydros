@@ -134,16 +134,6 @@ This repository is configured to publish to PyPI from GitHub Actions on each Git
 - Workflow: [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
 - Build metadata: [pyproject.toml](pyproject.toml)
 
-### One-time setup in PyPI
-
-1. In PyPI, open your project settings and add a **Trusted Publisher**.
-2. Use:
-    - Owner: your GitHub org/user
-    - Repository: `pyhydros`
-    - Workflow name: `publish-pypi.yml`
-    - Environment: `pypi`
-3. Save.
-
 ### Release flow
 
 1. Merge changes to `main`/`master` with conventional commits.
