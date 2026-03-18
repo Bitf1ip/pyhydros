@@ -127,6 +127,30 @@ For beta semantics (version `< 1.0.0`):
 - `fix:` bumps patch (`0.x.y`)
 - breaking changes can still trigger major semantics when you decide to move to `1.0.0+`
 
+## PyPI Publishing (GitHub Actions)
+
+This repository is configured to publish to PyPI from GitHub Actions on each GitHub Release:
+
+- Workflow: [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
+- Build metadata: [pyproject.toml](pyproject.toml)
+
+### One-time setup in PyPI
+
+1. In PyPI, open your project settings and add a **Trusted Publisher**.
+2. Use:
+    - Owner: your GitHub org/user
+    - Repository: `pyhydros`
+    - Workflow name: `publish-pypi.yml`
+    - Environment: `pypi`
+3. Save.
+
+### Release flow
+
+1. Merge changes to `main`/`master` with conventional commits.
+2. Release Please opens/updates a release PR.
+3. Merge that PR to create tag + GitHub Release.
+4. The PyPI workflow builds and publishes automatically.
+
 ## Notes
 
 - `connect_mqtt` infers the AWS IoT endpoint from responses to `/user` and `/thing/{id}`. If Hydros introduces new field names, update `_infer_iot_endpoint` accordingly.
