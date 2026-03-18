@@ -12,6 +12,7 @@ Create `.env` file with your credentials:
 ```
 HYDROS_USERNAME=your_email@example.com
 HYDROS_PASSWORD=your_password
+HYDROS_REGION=us-west-2
 ```
 
 ## Quick Start
@@ -65,6 +66,26 @@ finally:
         client.mqtt_client.disconnect()
 ```
 
+### 3. Dosing Logs
+
+```python
+from datetime import datetime, timedelta
+
+local_now = datetime.now().astimezone()
+start_of_day = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+end_of_day = start_of_day + timedelta(days=1)
+
+logs = client.get_dosing_logs(
+    hydros_id,
+    "Doser1",
+    count=200,
+    start=start_of_day,
+    end=end_of_day,
+)
+total_ml = sum(log.quantity_ml or 0.0 for log in logs)
+print(f"Total dosed today: {round(total_ml, 3)} ml")
+```
+
 ## API Reference
 
 ### Authentication
@@ -88,12 +109,25 @@ client.download_hydros_data(thing_id)     # Download Hydros data as bytes
 client.download_hydros_data_json(thing_id) # Download Hydros data as JSON
 ```
 
+### Dosing Logs
+```python
+client.get_dosing_logs(thing_id, output_name, count=100, start=None, end=None)
+# Returns a list of HydrosDosingLogEntry
+```
+
 ### Real-Time Monitoring
 ```python
 client.connect_mqtt(thing_id)                 # Establish AWS IoT MQTT session
 client.subscribe_thing_status(thing_id, fn)   # Stream Hydros updates via callback
 client.mqtt_client.publish(topic, payload)    # Optional: send commands/request data
 client.mqtt_client.disconnect()               # Cleanly close connection when done
+```
+
+### MQTT Commands
+```python
+client.publish_command(thing_id, ("Mode", "Normal"), payload=None)
+client.set_output_state(thing_id, "Heater1", "off")     # off/on/auto
+client.set_collective_mode(thing_id, "Feeding")
 ```
 
 ## Data Structures
@@ -114,6 +148,16 @@ client.mqtt_client.disconnect()               # Cleanly close connection when do
             "maxGraphRange": "<graph_max_c>",
             "alertLevel": "<alert_threshold>",
             "offset": "<calibration_offset>"
+        }
+        ,
+        "Sump leak": {
+            "type": "sense",
+            "unitId": 4,
+            "sensePort": "3$2",
+            "senseMode": "ropeLeak",
+            "invisible": False,
+            "alertLevel": 0,
+            "offset": 2
         }
     },
     "Output": {
@@ -236,5 +280,39 @@ client.mqtt_client.disconnect()               # Cleanly close connection when do
     }
 }
 ```
+
+### Alert Level Reference
+
+| Value | Description |
+| ----- | ----------- |
+| 0     | None        |
+| 1     | Yellow      |
+| 4     | Orange      |
+| 8     | Red         |
+
+### Probe Mode Reference
+
+| Value | Description |
+| ----- | ----------- |
+| 0     | Unused      |
+| 1     | PH          |
+| 2     | ORP (mV)    |
+| 3     | Alk (dKH)   |
+
+### Triple Level Reference
+
+| Value | Description |
+| ----- | ----------- |
+| 0     | Dry         |
+| 1     | Wet         |
+| 2     | Overflow    |
+
+### _OUTPUT_STATE_ALIASES
+
+| Alias | Value |
+| ----- | ----- |
+| off   | 0     |
+| on    | 1     |
+| auto  | -1    |
 
 

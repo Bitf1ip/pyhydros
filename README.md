@@ -88,27 +88,53 @@ python -m unittest -v
 
 The suite covers token expiry logic, Cognito error propagation, MQTT precondition checking, dynamic region inference, and MQTT endpoint discovery edge cases.
 
+## Versioning & Changelog
+
+This repository uses Semantic Versioning with a pre-1.0 beta line (starting at `0.1.0`) and an automated GitHub changelog/release workflow.
+
+- Version source: `__version__` in [__init__.py](__init__.py)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
+- Automation: [.github/workflows/release-please.yml](.github/workflows/release-please.yml)
+
+To get clean automated changelogs, use Conventional Commit prefixes in PR titles or commit messages:
+
+- `feat:` for new features
+- `fix:` for bug fixes
+- `docs:`, `chore:`, `refactor:`, `test:` for other updates
+- Add `!` (for example `feat!:`) for breaking changes
+
+For beta semantics (version `< 1.0.0`):
+
+- `feat:` bumps minor (`0.x.0`)
+- `fix:` bumps patch (`0.x.y`)
+- breaking changes can still trigger major semantics when you decide to move to `1.0.0+`
+
 ## Notes
 
 - `connect_mqtt` infers the AWS IoT endpoint from responses to `/user` and `/thing/{id}`. If Hydros introduces new field names, update `_infer_iot_endpoint` accordingly.
 - `subscribe_thing_status` queues subscriptions until the MQTT connection is ready and automatically issues the LISTEN request.
 - The example script at the bottom of `pyhydros.py` demonstrates a full interactive workflow.
 
+## Infrastructure & Polling Politeness
+This library interacts with the CoralVue/Hydros cloud infrastructure. To maintain the stability of these services for the entire community avoid pulling api at unreasonable rate (e.g more than every few minutes).
+
 ## License
 
-Distributed under the terms of the LICENSE file in this repository.
+Distributed under the terms of the MIT LICENSE file in this repository.
 
 ## ⚠️ Safety Warning & Disclaimer 
 
-PyHydros is provided "as is" and "with all faults." The author makes no representations or warranties of any kind concerning the safety, suitability, or inaccuracies of this software.
+pyHydros is provided “as is” and “with all faults”, without warranty of any kind, express or implied. The author makes no representations or guarantees regarding safety, suitability, accuracy, reliability, availability, or fitness for any particular purpose.
 
-Use at your own risk. Improper configuration or software bugs could lead to:
+This software is not designed, tested, or intended for safety-critical, life-supporting, or fail-safe control systems. Do not rely on this integration for life-critical functions (e.g. temperature control, circulation, oxygenation) or for scenarios where equipment failure could result in property damage (e.g. floods, electrical hazards, or fire).
 
-Equipment malfunction or fire.
+Use of this software is entirely at your own risk. Improper configuration, software defects, network outages, cloud service changes, or unexpected behavior may result in equipment malfunction, property damage, or loss of aquatic life.
 
-Property damage (e.g., floods).
+Always validate behavior in a controlled or non-critical environment before enabling automations. For critical functions, use Hydros’ native controller features, which are specifically designed with local control, redundancy, and safety safeguards.
 
-Loss of aquatic life.
+In no event shall the author be liable for any direct, indirect, incidental, special, exemplary, or consequential damages arising from the use of, or inability to use, this software.
 
-Always test new configurations in a dry-run or controlled environment. This project is an independent community effort and is not affiliated with, authorized, maintained, or endorsed by CoralVue Hydros.
+Nothing in this project constitutes professional, electrical, or safety advice.
+
+This project is an independent, community-driven effort and is not affiliated with, authorized, maintained, or endorsed by CoralVue or Hydros. “Hydros” and “CoralVue” are trademarks of their respective owners and are used for identification purposes only.
 

@@ -7,18 +7,25 @@ Also supports real-time sensor data via AWS IoT MQTT.
 """
 
 import json
+import logging
 import requests
 import os
 import zlib
 import base64
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Callable
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, Callable, Sequence, Union, List
 from dataclasses import dataclass
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
 from awscrt import auth as awscrt_auth, io as awscrt_io, mqtt as awscrt_mqtt
 from awsiot import mqtt_connection_builder
+
+# Enable to debug AWS IoT Device SDK logs
+#import awscrt
+#awscrt.io.init_logging(awscrt.io.LogLevel.Debug, 'stderr')
 
 
 class HydrosError(Exception):
@@ -37,7 +44,73 @@ class HydrosMQTTError(HydrosError):
     """Raised when MQTT operations fail."""
 
 # Load environment variables from .env file
+
 load_dotenv()
+
+os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")  # Avoid IMDS credential lookups outside AWS
+
+logger = logging.getLogger(__name__)
+
+# Safety limits
+_MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024  # 10 MB
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+-\d+)$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_:.-]+$")
+_ALLOWED_S3_HOSTS = (
+    ".s3.amazonaws.com",
+    ".s3-accelerate.amazonaws.com",
+)
+# Regional virtual-hosted S3 endpoints: <bucket>.s3.<region>.amazonaws.com
+_S3_REGIONAL_HOST_RE = re.compile(
+    r"^[a-z0-9.-]+\.s3\.[a-z]{2}-[a-z]+-\d+\.amazonaws\.com$"
+)
+
+
+def _safe_zlib_decompress(data: bytes, *, max_bytes: int = _MAX_DECOMPRESSED_BYTES) -> bytes:
+    """Decompress zlib data with a size cap to prevent decompression bombs."""
+    dobj = zlib.decompressobj()
+    chunks: list[bytes] = []
+    total = 0
+    # Feed the data in one shot but limit output per call
+    chunk = dobj.decompress(data, max_bytes + 1)
+    total += len(chunk)
+    if total > max_bytes:
+        raise HydrosError(
+            f"Decompressed payload exceeds {max_bytes} byte limit "
+            f"({total}+ bytes) — possible decompression bomb"
+        )
+    chunks.append(chunk)
+    # Drain any remaining buffered output
+    while dobj.unconsumed_tail:
+        chunk = dobj.decompress(dobj.unconsumed_tail, max_bytes - total + 1)
+        total += len(chunk)
+        if total > max_bytes:
+            raise HydrosError(
+                f"Decompressed payload exceeds {max_bytes} byte limit "
+                f"({total}+ bytes) — possible decompression bomb"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _validate_s3_url(url: str) -> None:
+    """Ensure a signed URL points to a known S3 host over HTTPS."""
+    if not url or not url.startswith("https://"):
+        raise HydrosAPIError(f"Signed URL must use HTTPS (got {url[:40]!r}…)")
+    host = url.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].lower()
+    if not (
+        any(host.endswith(suffix) for suffix in _ALLOWED_S3_HOSTS)
+        or _S3_REGIONAL_HOST_RE.match(host)
+    ):
+        raise HydrosAPIError(
+            f"Signed URL host {host!r} is not a recognised S3 endpoint"
+        )
+
+
+def _validate_identifier(value: str, label: str = "identifier") -> str:
+    """Reject identifiers that contain path-traversal or unexpected characters."""
+    if not value or not _SAFE_ID_RE.match(value):
+        raise ValueError(f"Invalid {label}: {value!r}")
+    return value
 
 
 @dataclass
@@ -57,6 +130,17 @@ class AuthTokens:
         expiry = self.issued_at + timedelta(seconds=self.expires_in)
         return datetime.utcnow() >= expiry
 
+
+@dataclass
+class HydrosDosingLogEntry:
+    """Represents a dosing event returned by the Hydros logs API."""
+
+    thing_name: str
+    output_name: str
+    timestamp: Optional[datetime]
+    quantity_ml: Optional[float]
+    message: Optional[str]
+    raw: Dict[str, Any]
 
 class CognitoSRPAuth:
     """Implements AWS Cognito SRP authentication using boto3."""
@@ -177,7 +261,7 @@ class MQTTClient:
 
     def connect(self, session: boto3.Session, client_id: str = "pyhydros"):
         """Connect to AWS IoT MQTT over WebSockets using SigV4 signing."""
-        print(f"Attempting to connect to {self.endpoint} via AWS IoT Device SDK...")
+        logger.info(f"Attempting to connect to {self.endpoint} via AWS IoT Device SDK...")
 
         self._ensure_bootstrap()
         credentials_provider = self._build_credentials_provider(session)
@@ -198,11 +282,11 @@ class MQTTClient:
             connect_future = self.connection.connect()
             connect_future.result(15)
             self.connected = True
-            print("✓ Connected to AWS IoT MQTT")
+            logger.info("✓ Connected to AWS IoT MQTT")
             self._subscribe_pending_topics()
         except Exception as exc:
             self.connected = False
-            print(f"✗ Failed to connect to MQTT: {exc}")
+            logger.error(f"✗ Failed to connect to MQTT: {exc}")
             raise HydrosMQTTError(
                 f"Failed to connect to MQTT via AWS IoT SDK: {exc}"
             ) from exc
@@ -210,14 +294,14 @@ class MQTTClient:
     def subscribe(self, topic: str, callback: Callable[[str, Dict], None]):
         """Subscribe to an MQTT topic with a JSON callback."""
         if not self.connection:
-            print(f"⚠ No MQTT connection yet; queueing subscription to {topic}")
+            logger.warning(f"⚠ No MQTT connection yet; queueing subscription to {topic}")
 
         self.callbacks[topic] = callback
 
         if self.connection and self.connected:
             self._subscribe_topic(topic)
         else:
-            print("⚠ Not connected yet, will subscribe after connection")
+            logger.warning("⚠ Not connected yet, will subscribe after connection")
 
     def _subscribe_topic(self, topic: str):
         """Subscribe to a topic on the active connection."""
@@ -235,12 +319,12 @@ class MQTTClient:
                 payload = kwargs.get('payload')
 
             if topic is None or payload is None:
-                print("✗ MQTT callback missing topic or payload; skipping message")
+                logger.error("✗ MQTT callback missing topic or payload; skipping message")
                 return
 
             self._handle_message(topic, payload)
 
-        print(f"Subscribing to: {topic}")
+        logger.info(f"Subscribing to: {topic}")
         try:
             subscribe_future, _ = self.connection.subscribe(
                 topic=topic,
@@ -249,12 +333,12 @@ class MQTTClient:
             )
             subscribe_future.result(10)
         except Exception as exc:
-            print(f"✗ Failed to subscribe to {topic}: {exc}")
+            logger.error(f"✗ Failed to subscribe to {topic}: {exc}")
             raise HydrosMQTTError(f"Failed to subscribe to {topic}: {exc}") from exc
 
     def _handle_message(self, topic: str, payload: bytes):
         """Decode MQTT payload and dispatch to the registered callback."""
-        print(f"✓ Message received on {topic}")
+        logger.info(f"✓ Message received on {topic}")
         callback = self.callbacks.get(topic)
         matched_filter = None
         if not callback:
@@ -270,7 +354,7 @@ class MQTTClient:
             return
 
         if not payload:
-            print("⚠ MQTT payload empty")
+            logger.warning("⚠ MQTT payload empty")
             callback(topic, {})
             return
 
@@ -285,23 +369,23 @@ class MQTTClient:
                 header_bytes = payload[:space_index]
                 payload_bytes = candidate
 
-        # Attempt to decompress zlib-compressed data
+        # Attempt to decompress zlib-compressed data (size-limited)
         if payload_bytes[:2] in (b"x\x9c", b"x\x01"):
             try:
-                payload_bytes = zlib.decompress(payload_bytes)
-            except zlib.error as exc:
-                print(f"⚠ Failed to decompress MQTT payload: {exc}")
+                payload_bytes = _safe_zlib_decompress(payload_bytes)
+            except (zlib.error, HydrosError) as exc:
+                logger.warning(f"⚠ Failed to decompress MQTT payload: {exc}")
 
         try:
             payload_text = payload_bytes.decode("utf-8")
         except UnicodeDecodeError:
-            print("⚠ MQTT payload not valid UTF-8, forwarding raw bytes")
+            logger.warning("⚠ MQTT payload not valid UTF-8, forwarding raw bytes")
             callback(topic, payload_bytes)
             return
 
         payload_stripped = payload_text.strip()
         if not payload_stripped:
-            print("⚠ MQTT payload empty after decoding")
+            logger.warning("⚠ MQTT payload empty after decoding")
             callback(topic, {})
             return
 
@@ -316,7 +400,7 @@ class MQTTClient:
                     pass
             callback(topic, data)
         except json.JSONDecodeError as exc:
-            print(f"⚠ MQTT payload not JSON: {exc}. Forwarding raw text to callback")
+            logger.warning(f"⚠ MQTT payload not JSON: {exc}. Forwarding raw text to callback")
             if header_bytes:
                 callback(topic, {"_hydros_header": header_bytes, "raw": payload_bytes})
             else:
@@ -350,17 +434,17 @@ class MQTTClient:
     def _on_connection_interrupted(self, connection, error, **kwargs):
         """Handle unexpected interruptions."""
         self.connected = False
-        print(f"✗ MQTT connection interrupted: {error}")
+        logger.error(f"✗ MQTT connection interrupted: {error}")
 
     def _on_connection_resumed(self, connection, return_code, session_present, **kwargs):
         """Attempt to resubscribe when the connection is resumed."""
         if return_code == awscrt_mqtt.ConnectReturnCode.ACCEPTED:
             self.connected = True
-            print("✓ MQTT connection resumed")
+            logger.info("✓ MQTT connection resumed")
             if not session_present:
                 self._subscribe_pending_topics()
         else:
-            print(f"✗ MQTT connection resumed with code: {return_code}")
+            logger.error(f"✗ MQTT connection resumed with code: {return_code}")
 
     def disconnect(self):
         """Disconnect cleanly from AWS IoT."""
@@ -395,7 +479,7 @@ class MQTTClient:
             )
             publish_future.result(10)
         except Exception as exc:
-            print(f"✗ Failed to publish to {topic}: {exc}")
+            logger.error(f"✗ Failed to publish to {topic}: {exc}")
             raise HydrosMQTTError(f"Failed to publish to {topic}: {exc}") from exc
 
 
@@ -456,12 +540,11 @@ class HydrosAPI:
         # Extract user_id from API response (generated_user_id)
         try:
             user_info = self.get_user()
-            self.user_profile = user_info
             self.user_id = user_info.get('generated_user_id')
             if self.user_id:
-                print(f"✓ User authenticated (ID: {self.user_id})")
+                logger.info(f"✓ User authenticated (ID: {self.user_id})")
         except Exception as e:
-            print(f"Warning: Could not retrieve user info: {str(e)}")
+            logger.warning(f"Warning: Could not retrieve user info: {str(e)}")
         
         return self.tokens
     
@@ -472,32 +555,75 @@ class HydrosAPI:
         elif self.tokens.is_expired():
             self.refresh_tokens()
     
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+        """Decode the payload section of a JWT without verification."""
+        parts = token.split('.')
+        if len(parts) < 2:
+            raise ValueError("Token does not have a payload segment")
+        payload = parts[1]
+        padding = -len(payload) % 4
+        if padding:
+            payload += '=' * padding
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+
     def _update_region_from_token(self, id_token: str):
         """Derive AWS region from the Cognito ID token issuer."""
         try:
-            parts = id_token.split('.')
-            if len(parts) < 2:
-                return
-            payload = parts[1]
-            padding = -len(payload) % 4
-            if padding:
-                payload += '=' * padding
-            decoded = base64.urlsafe_b64decode(payload)
-            token_data = json.loads(decoded)
+            token_data = self._decode_jwt_payload(id_token)
             iss = token_data.get('iss', '')
+            # Only trust issuers that match the Cognito URL pattern
+            if not iss or not re.match(
+                r"^https://cognito-idp\.[a-z]{2}(-[a-z]+-\d+)\.amazonaws\.com/",
+                iss,
+            ):
+                logger.debug("JWT issuer %r does not match Cognito pattern; skipping region update", iss)
+                return
             pool_fragment = iss.rstrip('/').split('/')[-1] if iss else None
             region_candidate = None
             if pool_fragment and '_' in pool_fragment:
                 region_candidate = pool_fragment.split('_', 1)[0]
             elif pool_fragment and pool_fragment.startswith('aws-'):
                 region_candidate = pool_fragment
-            if region_candidate and region_candidate != self.region:
-                print(f"Updating AWS region to {region_candidate} derived from token issuer")
-                self.region = region_candidate
-                self.auth.set_region(region_candidate)
+            if region_candidate and not _AWS_REGION_RE.match(region_candidate):
+                logger.warning("Derived region %r does not look valid; ignoring", region_candidate)
+                return
+            if region_candidate:
+                self._apply_region_update(region_candidate, "token issuer")
         except Exception:
             # Silent failure keeps existing region if parsing fails
             pass
+
+    def _update_region_from_endpoint(self, endpoint: str):
+        """Derive AWS region from an IoT endpoint hostname."""
+        if not endpoint:
+            return
+
+        host = endpoint.strip()
+        if host.startswith("https://") or host.startswith("http://"):
+            host = host.split("://", 1)[1]
+        host = host.split("/", 1)[0]
+
+        parts = host.split('.')
+        try:
+            idx = parts.index("iot")
+        except ValueError:
+            return
+
+        if idx + 1 >= len(parts):
+            return
+
+        region_candidate = parts[idx + 1]
+        if region_candidate and _AWS_REGION_RE.match(region_candidate):
+            self._apply_region_update(region_candidate, "IoT endpoint")
+
+    def _apply_region_update(self, region_candidate: str, source: str) -> None:
+        if not region_candidate or region_candidate == self.region:
+            return
+        logger.info(f"Updating AWS region to {region_candidate} derived from {source}")
+        self.region = region_candidate
+        self.auth.set_region(region_candidate)
 
     def refresh_tokens(self):
         """Refresh the access token using the refresh token."""
@@ -583,6 +709,7 @@ class HydrosAPI:
         Returns:
             Dict containing sensor/thing data
         """
+        _validate_identifier(thing_id, "thing_id")
         response = requests.get(
             f"{self.api_url}/thing/{thing_id}",
             headers=self._get_headers()
@@ -601,6 +728,7 @@ class HydrosAPI:
         Returns:
             Updated thing data
         """
+        _validate_identifier(thing_id, "thing_id")
         response = requests.put(
             f"{self.api_url}/thing/{thing_id}",
             json=data,
@@ -611,6 +739,7 @@ class HydrosAPI:
     
     def get_signed_url(self, hydros_id: str, method: str = "GET") -> str:
         """Get a signed S3 URL for accessing Hydros configuration data."""
+        _validate_identifier(hydros_id, "hydros_id")
         response = requests.post(
             f"{self.api_url}/signed_url",
             json={"method": method, "key": hydros_id},
@@ -627,6 +756,7 @@ class HydrosAPI:
     def download_hydros_data(self, hydros_id: str) -> bytes:
         """Download Hydros configuration from S3 using a signed URL."""
         signed_url = self.get_signed_url(hydros_id)
+        _validate_s3_url(signed_url)
         
         # Download from S3 (no auth header needed for signed URL)
         response = requests.get(signed_url)
@@ -640,52 +770,176 @@ class HydrosAPI:
         # Check if data is zlib compressed (starts with 0x78 0x9c or 0x78 0x01)
         if data[:2] == b'x\x9c' or data[:2] == b'x\x01':
             try:
-                data = zlib.decompress(data)
-            except zlib.error as e:
+                data = _safe_zlib_decompress(data)
+            except (zlib.error, HydrosError) as e:
                 raise HydrosAPIError(f"Failed to decompress Hydros data: {str(e)}") from e
         
         return json.loads(data)
 
-    # Legacy aliases retained for backward compatibility
-    download_sensor_data = download_hydros_data
-    download_sensor_data_json = download_hydros_data_json
-    
-    def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_dosing_logs(
+        self,
+        thing_name: str,
+        output_name: str,
+        *,
+        count: int = 100,
+        skip: int = 0,
+        start: Optional[Union[int, float, str, datetime]] = None,
+        end: Optional[Union[int, float, str, datetime]] = None,
+    ) -> List[HydrosDosingLogEntry]:
         """
-        Make a POST request to the API.
-        
+        Retrieve dosing log entries for a specific output.
+
         Args:
-            endpoint: API endpoint (e.g., '/user')
-            data: Request body
-        
+            thing_name: Hydros thing name housing the doser.
+            output_name: Output name (for example "Doser1").
+            count: Maximum number of records to return.
+            skip: Number of records to skip (for pagination).
+            start: Optional start time (datetime or epoch millis).
+            end: Optional end time (datetime or epoch millis).
+
         Returns:
-            Response JSON
+            A list of HydrosDosingLogEntry instances ordered newest-first.
         """
-        response = requests.post(
-            f"{self.api_url}{endpoint}",
-            json=data,
-            headers=self._get_headers()
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    def get(self, endpoint: str) -> Dict[str, Any]:
-        """
-        Make a GET request to the API.
-        
-        Args:
-            endpoint: API endpoint
-        
-        Returns:
-            Response JSON
-        """
+
+        params: Dict[str, Union[str, int]] = {
+            "thingName": thing_name,
+            "name": output_name,
+            "count": count,
+            "skip": skip,
+        }
+
+        start_ms = self._coerce_epoch_millis(start)
+        end_ms = self._coerce_epoch_millis(end)
+        if start_ms is not None:
+            params["start"] = start_ms
+        if end_ms is not None:
+            params["end"] = end_ms
+
         response = requests.get(
-            f"{self.api_url}{endpoint}",
-            headers=self._get_headers()
+            f"{self.api_url}/logs",
+            headers=self._get_headers(),
+            params=params,
         )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise HydrosAPIError("Unexpected response payload when fetching logs")
+
+        entries: List[HydrosDosingLogEntry] = []
+        for record in payload:
+            if not isinstance(record, dict):
+                continue
+            timestamp = self._coerce_timestamp(record.get("time"))
+            quantity = self._extract_dosing_quantity(record)
+            message_raw = record.get("valueString")
+            message = message_raw if isinstance(message_raw, str) else None
+            entries.append(
+                HydrosDosingLogEntry(
+                    thing_name=thing_name,
+                    output_name=output_name,
+                    timestamp=timestamp,
+                    quantity_ml=quantity,
+                    message=message,
+                    raw=record,
+                )
+            )
+        return entries
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> Optional[datetime]:
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                numeric = float(value.strip())
+            except (ValueError, AttributeError):
+                return None
+            return HydrosAPI._coerce_timestamp(numeric)
+        return None
+
+    @classmethod
+    def _extract_dosing_quantity(cls, record: Dict[str, Any]) -> Optional[float]:
+        value_string = record.get("valueString")
+        if isinstance(value_string, str):
+            match = cls._DOSE_VALUE_PATTERN.search(value_string)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    return None
+
+        for key in ("valueDec", "value"):
+            raw_value = record.get(key)
+            if raw_value is None:
+                continue
+            try:
+                numeric = float(raw_value)
+            except (TypeError, ValueError):
+                try:
+                    numeric = float(str(raw_value).strip())
+                except (ValueError, TypeError):
+                    continue
+            return numeric
+        return None
+
+    @staticmethod
+    def _coerce_epoch_millis(value: Optional[Union[int, float, str, datetime]]) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            return int(value.timestamp() * 1000)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(float(stripped))
+            except ValueError as exc:
+                raise TypeError(f"Could not interpret value '{value}' as epoch millis") from exc
+        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
     
+    ALERT_LEVEL_LABELS: Dict[int, str] = {
+        0: "None",
+        1: "Yellow",
+        4: "Orange",
+        8: "Red",
+    }
+
+    PROBE_MODE_LABELS: Dict[int, str] = {
+        0: "Unused",
+        1: "PH",
+        2: "ORP (mV)",
+        3: "Alk (dKH)",
+    }
+
+    TRIPLE_LEVEL_LABELS: Dict[int, str] = {
+        0: "Dry",
+        1: "Wet",
+        2: "Overflow",
+    }
+
+    _OUTPUT_STATE_ALIASES: Dict[str, int] = {
+        "off": 0,
+        "on": 1,
+        "auto": -1,
+    }
+
+    _OUTPUT_STATE_TOPIC_PREFIXES: Dict[int, str] = {
+        0: "b",
+        -1: "H",
+    }
+
+    _DOSE_VALUE_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*ml", re.IGNORECASE)
+
     def connect_mqtt(self, thing_id: Optional[str] = None, client_id: str = "pyhydros") -> MQTTClient:
         """
         Connect to AWS IoT MQTT for real-time sensor data.
@@ -699,6 +953,9 @@ class HydrosAPI:
         Returns:
             Connected MQTTClient instance
         """
+        if client_id == "pyhydros":
+            client_id = f"{client_id}-{uuid.uuid4().hex}"
+
         if not self.user_id:
             raise ValueError("Not authenticated. Call authenticate() first.")
         
@@ -707,13 +964,13 @@ class HydrosAPI:
         
         try:
             # Get thing details
-            print(f"Getting thing details...")
+            logger.info(f"Getting thing details...")
             thing_details = self.get_thing(thing_id)
             
             # If this is a child sensor, get the parent thing
             parent_thing_id = thing_details.get('parent')
             if parent_thing_id:
-                print(f"This is a child sensor, getting parent thing: {parent_thing_id}")
+                logger.info(f"This is a child sensor, getting parent thing: {parent_thing_id}")
                 thing_details = self.get_thing(parent_thing_id)
             
             # Get cognito_identity (it's already an IdentityId, not a pool ID)
@@ -721,7 +978,7 @@ class HydrosAPI:
             if not identity_id:
                 raise HydrosMQTTError("No cognito_identity found in thing details")
             
-            print(f"✓ Got Identity ID: {identity_id}")
+            logger.info(f"✓ Got Identity ID: {identity_id}")
 
             resolved_endpoint = self._infer_iot_endpoint(thing_details, self.user_profile)
             if not resolved_endpoint:
@@ -730,7 +987,8 @@ class HydrosAPI:
                     "Pass mqtt_endpoint explicitly or ensure API includes iotEndpoint."
                 )
             
-            print(f"Using IoT endpoint from API: {resolved_endpoint}")
+            logger.info(f"Using IoT endpoint from API: {resolved_endpoint}")
+            self._update_region_from_endpoint(resolved_endpoint)
 
             # Initialize AWS IoT Device SDK client
             self.mqtt_client = MQTTClient(resolved_endpoint, region=self.region)
@@ -738,17 +996,8 @@ class HydrosAPI:
             # Extract user pool ID from ID token
             # Token has issuer like: https://cognito-idp.us-west-2.amazonaws.com/us-west-2_XXXXXX
             try:
-                parts = self.tokens.id_token.split('.')
-                payload = parts[1]
-                padding = 4 - len(payload) % 4
-                if padding != 4:
-                    payload += '=' * padding
-                decoded = base64.urlsafe_b64decode(payload)
-                token_data = json.loads(decoded)
-                
+                token_data = self._decode_jwt_payload(self.tokens.id_token)
                 iss = token_data.get('iss', '')
-                # Extract user pool ID from issuer URL
-                # Format: https://cognito-idp.us-west-2.amazonaws.com/us-west-2_XXXXXX
                 user_pool_id = iss.split('/')[-1] if '/' in iss else None
                 
                 if not user_pool_id:
@@ -756,7 +1005,9 @@ class HydrosAPI:
                         f"Could not extract user_pool_id from token issuer: {iss}"
                     )
                 
-                print(f"✓ Got User Pool ID: {user_pool_id}")
+                logger.info(f"✓ Got User Pool ID: {user_pool_id}")
+            except HydrosMQTTError:
+                raise
             except Exception as e:
                 raise HydrosMQTTError(
                     f"Failed to extract user pool ID from token: {str(e)}"
@@ -766,7 +1017,7 @@ class HydrosAPI:
             cognito_identity_client = boto3.client('cognito-identity', region_name=self.region)
             
             # Get temporary credentials using the identity ID we got from thing details
-            print(f"Getting temporary AWS credentials...")
+            logger.info(f"Getting temporary AWS credentials...")
             creds_response = cognito_identity_client.get_credentials_for_identity(
                 IdentityId=identity_id,
                 Logins={
@@ -775,7 +1026,7 @@ class HydrosAPI:
             )
             
             temp_creds = creds_response['Credentials']
-            print(f"✓ Got temporary credentials (AccessKeyId: {temp_creds['AccessKeyId'][:10]}...)")
+            logger.info(f"✓ Got temporary credentials (AccessKeyId: {temp_creds['AccessKeyId'][:10]}...)")
             
             # Create session with temporary credentials
             session = boto3.Session(
@@ -788,9 +1039,7 @@ class HydrosAPI:
             self.mqtt_client.connect(session, client_id=client_id)
             
         except Exception as e:
-            print(f"✗ Failed to get credentials: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"✗ Failed to get credentials: {str(e)}", exc_info=True)
             raise HydrosMQTTError(f"Failed to connect MQTT: {str(e)}") from e
         
         return self.mqtt_client
@@ -824,50 +1073,163 @@ class HydrosAPI:
         response_topic = f"{self.user_id}/{thing_id}/rsp/#"
         request_topic = f"{self.user_id}/{thing_id}/req/LISTEN/statusc"
 
-        print(f"Subscribing to: {response_topic}")
+        logger.info(f"Subscribing to: {response_topic}")
         self.mqtt_client.subscribe(response_topic, callback)
 
         # Send request to start streaming status updates (empty payload matches web client)
         try:
             self.mqtt_client.publish(request_topic, payload=b"", qos=awscrt_mqtt.QoS.AT_LEAST_ONCE)
-            print(f"Requested status updates on {request_topic}")
+            logger.info(f"Requested status updates on {request_topic}")
         except Exception as exc:
-            print(f"⚠ Failed to request status updates: {exc}")
-    
+            logger.warning(f"⚠ Failed to request status updates: {exc}")
+
+    def _ensure_mqtt_connected(self, thing_id: str, *, client_id: str = "pyhydros") -> None:
+        """Ensure an MQTT session is active before publishing commands."""
+        if self.mqtt_client and getattr(self.mqtt_client, "connected", False):
+            return
+        self.connect_mqtt(thing_id=thing_id, client_id=client_id)
+
+    def publish_command(
+        self,
+        thing_id: str,
+        command_path: Union[Sequence[str], str],
+        payload: Optional[Any] = None,
+        *,
+        method: str = "PUT",
+        topic_prefix: Optional[str] = None,
+        client_id: str = "pyhydros",
+        qos: awscrt_mqtt.QoS = awscrt_mqtt.QoS.AT_LEAST_ONCE,
+        retain: bool = False,
+    ) -> None:
+        """Publish a Hydros MQTT command to the specified thing."""
+        if not self.user_id:
+            raise HydrosMQTTError("User ID not available. Call authenticate() first.")
+
+        if not thing_id:
+            raise ValueError("thing_id is required")
+
+        if isinstance(command_path, str):
+            command_parts = [command_path]
+        else:
+            command_parts = list(command_path)
+
+        sanitized_parts = [part.strip("/") for part in command_parts if part]
+        if not sanitized_parts:
+            raise ValueError("command_path must contain at least one segment")
+
+        method_token = (method or "").strip().upper() or "PUT"
+
+        topic_prefix_value = topic_prefix or ""
+        topic = f"{topic_prefix_value}{self.user_id}/{thing_id}/req/{method_token}/" + "/".join(sanitized_parts)
+
+        self._ensure_mqtt_connected(thing_id, client_id=client_id)
+        if not self.mqtt_client or not getattr(self.mqtt_client, "connected", False):
+            raise HydrosMQTTError("MQTT client is not connected")
+
+        self.mqtt_client.publish(topic, payload, qos=qos, retain=retain)
+
+    def set_output_state(
+        self,
+        thing_id: str,
+        output_name: str,
+        state: Union[int, str], # off, on, auto
+        *,
+        topic_prefix: Optional[str] = None,
+        payload_prefix: str = "",
+        client_id: str = "pyhydros",
+        qos: awscrt_mqtt.QoS = awscrt_mqtt.QoS.AT_LEAST_ONCE,
+    ) -> None:
+        """Change the state of a named output via MQTT."""
+        numeric_state = self._coerce_output_state(state)
+        payload = {"State": numeric_state, "Prefix": payload_prefix}
+        topic_prefix_value = topic_prefix
+        if topic_prefix_value is None:
+            topic_prefix_value = self._OUTPUT_STATE_TOPIC_PREFIXES.get(numeric_state, "")
+
+        self.publish_command(
+            thing_id,
+            ("Output", output_name),
+            payload,
+            topic_prefix=topic_prefix_value,
+            client_id=client_id,
+            qos=qos,
+        )
+
+    def set_collective_mode(
+        self,
+        thing_id: str,
+        mode: str, # User defined; Hydros defaults are: Feeding, Normal and Water Change
+        *,
+        topic_prefix: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        client_id: str = "pyhydros",
+        qos: awscrt_mqtt.QoS = awscrt_mqtt.QoS.AT_LEAST_ONCE,
+    ) -> None:
+        """Update the collective operating mode via MQTT using a literal mode string."""
+        mode_token = str(mode or "").strip()
+        if not mode_token:
+            raise ValueError("mode must be provided")
+
+        topic_prefix_value = topic_prefix or ""
+
+        self.publish_command(
+            thing_id,
+            ("Mode", mode_token),
+            payload,
+            topic_prefix=topic_prefix_value,
+            client_id=client_id,
+            qos=qos,
+        )
+
+    def _coerce_output_state(self, state: Union[int, str]) -> int:
+        """Normalize textual output states to their numeric representation."""
+        if isinstance(state, int):
+            return state
+
+        lookup_key = str(state).strip().lower()
+        if lookup_key not in self._OUTPUT_STATE_ALIASES:
+            raise ValueError(
+                "Unsupported output state. Use numeric values or one of: "
+                + ", ".join(sorted(self._OUTPUT_STATE_ALIASES))
+            )
+        return self._OUTPUT_STATE_ALIASES[lookup_key]
+
 
 # Example usage
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] [%(asctime)s] %(message)s")
+
     import time
-    from threading import Thread
     
     # Initialize the client
     client = HydrosAPI()
     
     # Authenticate
-    print("=" * 60)
-    print("HYDROS API CLIENT - EXAMPLE")
-    print("=" * 60)
-    print("\n1. Authenticating...")
+    logger.info("=" * 60)
+    logger.info("HYDROS API CLIENT - EXAMPLE")
+    logger.info("=" * 60)
+    logger.info("\n1. Authenticating...")
     
     tokens = client.authenticate()
-    print(f"✓ Authenticated successfully")
-    print(f"  User ID: {client.user_id}\n")
+    logger.info(f"✓ Authenticated successfully")
+    logger.info(f"  User ID: {client.user_id}\n")
     
     # Get user info
-    print("2. Getting user information...")
+    logger.info("2. Getting user information...")
     user_info = client.get_user()
     things = user_info.get('things', [])
-    print(f"✓ Found {len(things)} hydros\n")
+    logger.info(f"✓ Found {len(things)} hydros\n")
     for thing in things:
         thing_id = thing.get('thingName', thing.get('id', 'Unknown'))
-        print(f"  - Hydros ID: {thing_id}")
+        logger.info(f"  - Hydros: {thing}")
 
     if not things:
-        print("No sensors found")
+        logger.info("No sensors found")
         exit(1)
     
     collective_thing = None
-    # Find collective
+
+    # Choose the device or collective 
     for thing in things:
         if thing.get('thingType') == 'Collective':
             collective_thing = thing
@@ -877,30 +1239,50 @@ if __name__ == "__main__":
         collective_thing = things[0]    
 
     thing_id = collective_thing.get('thingName', collective_thing.get('id', 'Unknown'))
-    print(f"3. Using thing: {thing_id}\n")
+    logger.info(f"3. Using thing: {thing_id}\n")
     
     # Show hydros configuration
-    print("4. Hydros Configuration:")
-    print("-" * 60)
+    logger.info("4. Hydros Configuration:")
+    logger.info("-" * 60)
     sensor_metadata = client.get_thing(thing_id)
-    print(f"  Friendly Name: {sensor_metadata.get('friendlyName')}")
-    print(f"  Status: {'Connected' if sensor_metadata.get('connectionStatus') == 1 else 'Disconnected'}")
-    print(f"  Last Update: {sensor_metadata.get('lastStatusDate', 'Unknown')}")
+    logger.info(f"  Friendly Name: {sensor_metadata.get('friendlyName')}")
+    logger.info(f"  Status: {'Connected' if sensor_metadata.get('connectionStatus') == 1 else 'Disconnected'}")
+    logger.info(f"  Last Update: {sensor_metadata.get('lastStatusDate', 'Unknown')}")
     
     # Download sensor data
-    print("\n5. Downloading Configuration Data from S3...")
-    print("-" * 60)
+    logger.info("\n5. Downloading Configuration Data from S3...")
+    logger.info("-" * 60)
     try:
         sensor_data = client.download_hydros_data_json(thing_id)
         if sensor_data:
-            print(sensor_data)
+            logger.info(sensor_data)
             
     except Exception as e:
-        print(f"✗ Could not fetch S3 data: {e}")
+        logger.error(f"✗ Could not fetch S3 data: {e}")
+
+    # Example get doser logs
+    # local_now = datetime.now().astimezone()
+    # start_of_day = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # end_of_day = start_of_day + timedelta(days=1)
+    # logs = client.get_dosing_logs(
+    #     thing_id,
+    #     "<doser_name>",
+    #     count=500,
+    #     start=start_of_day,
+    #     end=end_of_day,
+    # )
+    # total_ml = 0.0
+    # for log in logs:
+    #     if log.quantity_ml is not None:
+    #         total_ml += float(log.quantity_ml)
+    #     logger.info(
+    #         f"Dosing Log - Time: {log.timestamp}, Quantity: {log.quantity_ml} ml, Message: {log.message}"
+    #     )
+    # logger.info(f"Total dosed today: {round(total_ml, 3)} ml")
     
     # Connect to MQTT and subscribe to sensor status
-    print("\n6. Attempting Real-Time Monitoring via MQTT...")
-    print("-" * 60)
+    logger.info("\n6. Attempting Real-Time Monitoring via MQTT...")
+    logger.info("-" * 60)
     
     try:
         client.connect_mqtt(thing_id=thing_id)
@@ -908,28 +1290,27 @@ if __name__ == "__main__":
         # Define callback to print received messages
         def on_message_received(topic, payload):
             timestamp = datetime.now().strftime('%H:%M:%S')
-            print(f"\n[{timestamp}] Message received on {topic}:")
+            logger.info(f"\n[{timestamp}] Message received on {topic}:")
             if isinstance(payload, dict):
-                print(json.dumps(payload, indent=2))
+                logger.debug(json.dumps(payload, indent=2))
             else:
-                print(payload)
+                logger.debug(payload)
         
         # Subscribe to sensor status
         client.subscribe_thing_status(thing_id, on_message_received)
         
-        # Listen for messages for 30 seconds
-        print("✓ Subscribed to sensor topic")
-        print("\nListening for MQTT messages (30 seconds)...")
-        print("=" * 60)
+        # Listen for messages for 600 seconds
+        logger.info("✓ Subscribed to sensor topic")
+        logger.info("\nListening for MQTT messages (5 seconds)...")
+        logger.info("=" * 60)
         
-        import time
-        for i in range(30):
+        for i in range(5):
             time.sleep(1)
             if (i + 1) % 10 == 0:
-                print(f"[{i + 1}s] Still listening...")
+                logger.info(f"[{i + 1}s] Still listening...")
         
-        print("\n✓ Done listening")
+        logger.info("\n✓ Done listening")
         
     except Exception as e:
-        print("⚠ MQTT not available: {str(e)}")
+        logger.warning(f"⚠ MQTT not available: {str(e)}")
     
