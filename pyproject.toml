@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyhydros"
+dynamic = ["version"]
+description = "Python helper library for Hydros aquarium controller"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "PyHydros Contributors" }
+]
+keywords = ["hydros", "pyhydros"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet",
+  "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+  "python-dotenv>=1.0.0",
+  "requests>=2.28.0",
+  "boto3>=1.26.0",
+  "awsiotsdk>=1.15.2",
+  "awscrt>=0.16.11"
+]
+
+[tool.setuptools]
+py-modules = ["pyhydros"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pyhydros.__version__" }

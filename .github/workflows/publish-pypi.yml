@@ -5,6 +5,11 @@ on:
     types:
       - published
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to publish (branch, tag, or SHA)"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
@@ -16,6 +21,15 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Validate project files
+        run: |
+          pwd
+          ls -la
+          test -f pyproject.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
