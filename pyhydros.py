@@ -6,7 +6,7 @@ and provides authenticated access to the Hydros API at https://cv.hydros.link/us
 Also supports real-time sensor data via AWS IoT MQTT.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.3.0"
 
 import json
 import logging
