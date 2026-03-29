@@ -6,7 +6,7 @@ and provides authenticated access to the Hydros API at https://cv.hydros.link/us
 Also supports real-time sensor data via AWS IoT MQTT.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import json
 import logging
@@ -16,6 +16,7 @@ import zlib
 import base64
 import re
 import uuid
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Callable, Sequence, Union, List
 from dataclasses import dataclass
@@ -56,7 +57,6 @@ logger = logging.getLogger(__name__)
 # Safety limits
 _MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024  # 10 MB
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+-\d+)$")
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_:.-]+$")
 _ALLOWED_S3_HOSTS = (
     ".s3.amazonaws.com",
     ".s3-accelerate.amazonaws.com",
@@ -109,10 +109,65 @@ def _validate_s3_url(url: str) -> None:
 
 
 def _validate_identifier(value: str, label: str = "identifier") -> str:
-    """Reject identifiers that contain path-traversal or unexpected characters."""
-    if not value or not _SAFE_ID_RE.match(value):
+    """Validate and normalize ID-like values while blocking path traversal input."""
+    if value is None:
         raise ValueError(f"Invalid {label}: {value!r}")
-    return value
+
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"Invalid {label}: {value!r}")
+
+    if any(token in normalized for token in ("/", "\\", "..", "\x00")):
+        raise ValueError(f"Invalid {label}: {value!r}")
+
+    if any(ord(ch) < 32 for ch in normalized):
+        raise ValueError(f"Invalid {label}: {value!r}")
+
+    return normalized
+
+
+def _redact_sensitive_fields(payload: Any) -> Any:
+    """Recursively redact sensitive values in dict/list payloads for safe logging."""
+    sensitive_exact_keys = {
+        "generated_user_id",
+        "certificate_arn",
+        "thing_arn",
+        "cognito_identity",
+        "email",
+    }
+
+    sensitive_key_fragments = (
+        "password",
+        "secret",
+        "token",
+        "email",
+        "identity",
+        "user_id",
+        "arn",
+        "access_key",
+        "session",
+    )
+
+    def _is_sensitive_key(key: str) -> bool:
+        key_lower = key.lower()
+        if key_lower in sensitive_exact_keys:
+            return True
+        return any(fragment in key_lower for fragment in sensitive_key_fragments)
+
+    if isinstance(payload, dict):
+        redacted: Dict[str, Any] = {}
+        for key, value in payload.items():
+            key_text = str(key)
+            if _is_sensitive_key(key_text):
+                redacted[key_text] = "<redacted>"
+            else:
+                redacted[key_text] = _redact_sensitive_fields(value)
+        return redacted
+
+    if isinstance(payload, list):
+        return [_redact_sensitive_fields(item) for item in payload]
+
+    return payload
 
 
 @dataclass
@@ -711,9 +766,10 @@ class HydrosAPI:
         Returns:
             Dict containing sensor/thing data
         """
-        _validate_identifier(thing_id, "thing_id")
+        thing_id = _validate_identifier(thing_id, "thing_id")
+        encoded_thing_id = quote(thing_id, safe="")
         response = requests.get(
-            f"{self.api_url}/thing/{thing_id}",
+            f"{self.api_url}/thing/{encoded_thing_id}",
             headers=self._get_headers()
         )
         response.raise_for_status()
@@ -730,9 +786,10 @@ class HydrosAPI:
         Returns:
             Updated thing data
         """
-        _validate_identifier(thing_id, "thing_id")
+        thing_id = _validate_identifier(thing_id, "thing_id")
+        encoded_thing_id = quote(thing_id, safe="")
         response = requests.put(
-            f"{self.api_url}/thing/{thing_id}",
+            f"{self.api_url}/thing/{encoded_thing_id}",
             json=data,
             headers=self._get_headers()
         )
@@ -741,7 +798,7 @@ class HydrosAPI:
     
     def get_signed_url(self, hydros_id: str, method: str = "GET") -> str:
         """Get a signed S3 URL for accessing Hydros configuration data."""
-        _validate_identifier(hydros_id, "hydros_id")
+        hydros_id = _validate_identifier(hydros_id, "hydros_id")
         response = requests.post(
             f"{self.api_url}/signed_url",
             json={"method": method, "key": hydros_id},
@@ -1199,7 +1256,7 @@ class HydrosAPI:
 
 # Example usage
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] [%(asctime)s] %(message)s")
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] [%(asctime)s] %(message)s")
 
     import time
     
@@ -1223,7 +1280,7 @@ if __name__ == "__main__":
     logger.info(f"✓ Found {len(things)} hydros\n")
     for thing in things:
         thing_id = thing.get('thingName', thing.get('id', 'Unknown'))
-        logger.info(f"  - Hydros: {thing}")
+        logger.info(f"  - Hydros: {_redact_sensitive_fields(thing)}")
 
     if not things:
         logger.info("No sensors found")

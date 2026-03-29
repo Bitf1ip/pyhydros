@@ -224,6 +224,42 @@ class TestHydrosAPI(unittest.TestCase):
             with self.assertRaises(HydrosAuthError):
                 self.api._get_headers()
 
+    @patch("pyhydros.requests.get")
+    def test_get_thing_allows_spaces_and_url_encodes_path(self, mock_get):
+        token = AuthTokens(
+            access_token="a",
+            id_token="id",
+            refresh_token="r",
+            issued_at=datetime.utcnow(),
+        )
+        self.api.tokens = token
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"thingName": "The 279e9cdb"}
+        mock_get.return_value = mock_response
+
+        data = self.api.get_thing("The 279e9cdb")
+
+        self.assertEqual(data["thingName"], "The 279e9cdb")
+        called_url = mock_get.call_args.args[0]
+        self.assertTrue(called_url.endswith("/thing/The%20279e9cdb"))
+
+    def test_list_things_prefers_thing_name_over_id(self):
+        self.api.get_user = MagicMock(
+            return_value={
+                "things": [
+                    {"id": "abc123", "thingName": "Display Name"},
+                    {"thingName": "Name Only"},
+                    {"id": "id-only"},
+                ]
+            }
+        )
+
+        thing_ids = self.api.list_things()
+
+        self.assertEqual(thing_ids, ["Display Name", "Name Only", "id-only"])
+
     def test_publish_command_requires_user_id(self):
         client = MagicMock()
         client.connected = True
