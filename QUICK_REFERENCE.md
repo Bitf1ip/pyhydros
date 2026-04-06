@@ -130,6 +130,45 @@ client.set_output_state(thing_id, "Heater1", "off")     # off/on/auto
 client.set_collective_mode(thing_id, "Feeding")
 ```
 
+### Change Mode (Verified)
+
+`change_mode` is the recommended way to switch the controller's operating mode.
+Unlike `set_collective_mode` (fire-and-forget), it performs a full verified exchange:
+
+```python
+# Blocks until the controller confirms the new mode
+client.change_mode(thing_id, "Water Change")
+client.change_mode(thing_id, "Normal")
+
+# Custom timeout (seconds)
+client.change_mode(thing_id, "Feeding", timeout=15)
+```
+
+**Signature:**
+```python
+client.change_mode(
+    thing_id,
+    mode,               # e.g. "Normal", "Feeding", "Water Change"
+    *,
+    timeout=10.0,        # seconds per wait stage (ack + status)
+    client_id="pyhydros",
+    qos=QoS.AT_LEAST_ONCE,
+)
+```
+
+**What it does:**
+1. Publishes `PUT/Mode/<mode>` and waits for a `200` receipt ack.
+2. Publishes `LISTEN/statusc` to request a status refresh.
+3. Verifies the `"mode"` field in the status response matches the requested mode.
+
+**Raises `HydrosMQTTError` when:**
+- The ack times out or returns non-200.
+- The status response times out.
+- The status response reports a different mode than requested.
+
+> The controller returns `200` even for invalid mode names — the status
+> verification step is the authoritative check.
+
 ## Data Structures
 
 ### Hydros MQTT schemas

@@ -78,6 +78,28 @@ client.subscribe_thing_status(thing_id, handle_update)
 
 The helper publishes the required LISTEN request so that Hydros starts streaming status updates on the `/rsp/#` topic family. Incoming payloads are automatically decompressed, parsed as JSON, and annotated with `_hydros_header` when Hydros prepends header metadata.
 
+### Change Controller Mode
+
+`change_mode` sends a mode-change command, waits for the controller acknowledgement, then verifies the mode actually changed by inspecting the status response:
+
+```python
+# Switch to "Water Change" mode (blocks until verified)
+client.change_mode(thing_id, "Water Change")
+
+# Switch back to "Normal"
+client.change_mode(thing_id, "Normal")
+```
+
+The method performs a three-step verified exchange:
+
+1. Publishes `PUT/Mode/<mode>` and waits for a `200` receipt acknowledgement.
+2. Requests a status refresh via `LISTEN/statusc`.
+3. Parses the status response and confirms the `mode` field matches the requested mode.
+
+If the controller does not acknowledge in time, returns a non-200 status, or reports a different mode in the status response, a `HydrosMQTTError` is raised.
+
+> **Note:** The Hydros controller returns `200` for *any* mode name — even invalid ones. The `200` only confirms message receipt, not that the mode was applied. The status verification step is what catches invalid or failed mode changes.
+
 ### REST and S3 Helpers
 
 ```python

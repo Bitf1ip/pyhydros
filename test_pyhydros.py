@@ -326,6 +326,278 @@ class TestHydrosAPI(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.api.set_collective_mode("thing123", " ")
 
+    # ------------------------------------------------------------------ #
+    # change_mode                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _setup_mqtt(self):
+        """Return a pre-wired mock MQTT client and patch _ensure_mqtt_connected."""
+        self.api.user_id = "user123"
+        client = MagicMock()
+        client.connected = True
+        self.api.mqtt_client = client
+        self.api._ensure_mqtt_connected = MagicMock()
+        return client
+
+    @staticmethod
+    def _setup_ack_success(client, mode: str = "Normal", thing_id: str = "thing123"):
+        """Wire subscribe/publish mocks so a successful 200 ack and status response are received.
+
+        When the mode-change command is published, the ack handler fires with
+        ``"200 "``.  When the ``LISTEN/statusc`` request is published, the
+        status handler is invoked with an already-parsed dict containing
+        ``{"mode": <mode>}`` (simulating what ``_handle_message`` delivers).
+        """
+        handlers: dict = {}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if topic == f"user123/{thing_id}/req/PUT/Mode/{mode}":
+                ack_filter = f"user123/{thing_id}/rsp/PUT/Mode/{mode}/#"
+                if ack_filter in handlers:
+                    handlers[ack_filter](
+                        f"user123/{thing_id}/rsp/PUT/Mode/{mode}/abc123",
+                        "200 ",
+                    )
+            elif topic == f"user123/{thing_id}/req/LISTEN/statusc":
+                status_filter = f"user123/{thing_id}/rsp/LISTEN/statusc/#"
+                if status_filter in handlers:
+                    handlers[status_filter](
+                        f"user123/{thing_id}/rsp/LISTEN/statusc/corr123",
+                        {"mode": mode, "millis": 12345},
+                    )
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+    def test_change_mode_publishes_correct_topic(self):
+        client = self._setup_mqtt()
+        self._setup_ack_success(client, mode="Feeding")
+
+        self.api.change_mode("thing123", "Feeding", timeout=0.1)
+
+        # First publish call must be the mode-change command
+        first_call = client.publish.call_args_list[0]
+        topic_arg = first_call.args[0] if first_call.args else first_call[0][0]
+        # payload may be positional or keyword depending on the call site
+        if len(first_call.args) > 1:
+            payload_arg = first_call.args[1]
+        else:
+            payload_arg = first_call.kwargs.get("payload")
+        self.assertEqual(topic_arg, "user123/thing123/req/PUT/Mode/Feeding")
+        self.assertIsNone(payload_arg)
+
+    def test_change_mode_refresh_status_publishes_listen(self):
+        client = self._setup_mqtt()
+        self._setup_ack_success(client, mode="Normal")
+
+        self.api.change_mode("thing123", "Normal", timeout=0.1)
+
+        # Second publish call must be the LISTEN/statusc refresh
+        self.assertEqual(client.publish.call_count, 2)
+        second_call = client.publish.call_args_list[1]
+        topic_arg = second_call[0][0]
+        self.assertEqual(topic_arg, "user123/thing123/req/LISTEN/statusc")
+
+    def test_change_mode_requires_mode(self):
+        self._setup_mqtt()
+
+        with self.assertRaises(ValueError):
+            self.api.change_mode("thing123", "  ")
+
+    def test_change_mode_requires_user_id(self):
+        self.api.user_id = None
+        client = MagicMock()
+        client.connected = True
+        self.api.mqtt_client = client
+        self.api._ensure_mqtt_connected = MagicMock()
+
+        with self.assertRaises(HydrosMQTTError):
+            self.api.change_mode("thing123", "Normal")
+
+    def test_change_mode_raises_on_timeout_expiry(self):
+        """Timeout expiry must raise HydrosMQTTError."""
+        client = self._setup_mqtt()
+
+        with self.assertRaises(HydrosMQTTError) as ctx:
+            # timeout=0 expires immediately without a real device ack
+            self.api.change_mode("thing123", "Normal", timeout=0)
+
+        self.assertIn("Timed out waiting for mode-change acknowledgement", str(ctx.exception))
+
+        # The mode-change publish must still have been sent
+        client.publish.assert_called_once()
+
+    def test_change_mode_raises_on_non_200_ack(self):
+        client = self._setup_mqtt()
+        handlers: dict = {}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if topic == "user123/thing123/req/PUT/Mode/Normal":
+                handlers["user123/thing123/rsp/PUT/Mode/Normal/#"](
+                    "user123/thing123/rsp/PUT/Mode/Normal/abc123", "500 "
+                )
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+        with self.assertRaises(HydrosMQTTError) as ctx:
+            self.api.change_mode("thing123", "Normal", timeout=0.1)
+
+        self.assertIn("status 500", str(ctx.exception))
+
+    def test_change_mode_verifies_mode_in_status_response(self):
+        """A successful mode change parses the status and confirms the mode."""
+        client = self._setup_mqtt()
+        self._setup_ack_success(client, mode="Water Change")
+
+        # Should not raise — status response reports the same mode
+        self.api.change_mode(
+            "thing123", "Water Change", timeout=1
+        )
+
+    def test_change_mode_raises_on_mode_mismatch(self):
+        """If the status response reports a different mode, raise HydrosMQTTError."""
+        client = self._setup_mqtt()
+        handlers: dict = {}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if topic == "user123/thing123/req/PUT/Mode/Feeding":
+                handlers["user123/thing123/rsp/PUT/Mode/Feeding/#"](
+                    "user123/thing123/rsp/PUT/Mode/Feeding/abc123", "200 "
+                )
+            elif topic == "user123/thing123/req/LISTEN/statusc":
+                # Controller reports a DIFFERENT mode (already-parsed dict)
+                handlers["user123/thing123/rsp/LISTEN/statusc/#"](
+                    "user123/thing123/rsp/LISTEN/statusc/corr123",
+                    {"mode": "Normal"},
+                )
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+        with self.assertRaises(HydrosMQTTError) as ctx:
+            self.api.change_mode("thing123", "Feeding", timeout=1)
+
+        self.assertIn("Mode verification failed", str(ctx.exception))
+        self.assertIn("Feeding", str(ctx.exception))
+        self.assertIn("Normal", str(ctx.exception))
+
+    def test_change_mode_raises_on_status_timeout(self):
+        """If no status response arrives, raise HydrosMQTTError."""
+        client = self._setup_mqtt()
+        handlers: dict = {}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if topic == "user123/thing123/req/PUT/Mode/Normal":
+                handlers["user123/thing123/rsp/PUT/Mode/Normal/#"](
+                    "user123/thing123/rsp/PUT/Mode/Normal/abc123", "200 "
+                )
+            # Deliberately no response for LISTEN/statusc
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+        with self.assertRaises(HydrosMQTTError) as ctx:
+            self.api.change_mode("thing123", "Normal", timeout=0)
+
+        self.assertIn("Timed out waiting for status confirmation", str(ctx.exception))
+
+    def test_change_mode_cleans_up_subscriptions_on_error(self):
+        """Both ack and status subscriptions must be removed even on failure."""
+        client = self._setup_mqtt()
+        client.callbacks = {}
+
+        # Give the mock a real _unsubscribe_filter from MQTTClient
+        from pyhydros import MQTTClient
+        client._unsubscribe_filter = lambda f: MQTTClient._unsubscribe_filter(client, f)
+
+        handlers: dict = {}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+            client.callbacks[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if topic == "user123/thing123/req/PUT/Mode/Feeding":
+                handlers["user123/thing123/rsp/PUT/Mode/Feeding/#"](
+                    "user123/thing123/rsp/PUT/Mode/Feeding/abc123", "200 "
+                )
+            elif topic == "user123/thing123/req/LISTEN/statusc":
+                handlers["user123/thing123/rsp/LISTEN/statusc/#"](
+                    "user123/thing123/rsp/LISTEN/statusc/corr123",
+                    {"mode": "Normal"},
+                )
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+        with self.assertRaises(HydrosMQTTError):
+            self.api.change_mode("thing123", "Feeding", timeout=1)
+
+        # Both one-shot subscriptions must have been cleaned up
+        self.assertNotIn(
+            "user123/thing123/rsp/PUT/Mode/Feeding/#", client.callbacks
+        )
+        self.assertNotIn(
+            "user123/thing123/rsp/LISTEN/statusc/#", client.callbacks
+        )
+
+    def test_change_mode_sequential_calls_do_not_timeout(self):
+        """Calling change_mode twice must not leave stale cached subscriptions."""
+        client = self._setup_mqtt()
+        client.callbacks = {}
+
+        from pyhydros import MQTTClient
+        client._unsubscribe_filter = lambda f: MQTTClient._unsubscribe_filter(client, f)
+
+        handlers: dict = {}
+        call_count = {"status": 0}
+
+        def subscribe_side_effect(topic, handler):
+            handlers[topic] = handler
+            client.callbacks[topic] = handler
+
+        def publish_side_effect(topic, payload=None, qos=None, retain=False):
+            if "/req/PUT/Mode/" in topic:
+                mode = topic.rsplit("/", 1)[-1]
+                ack_filter = f"user123/thing123/rsp/PUT/Mode/{mode}/#"
+                if ack_filter in handlers:
+                    handlers[ack_filter](
+                        f"user123/thing123/rsp/PUT/Mode/{mode}/abc{call_count['status']}",
+                        "200 ",
+                    )
+            elif topic == "user123/thing123/req/LISTEN/statusc":
+                call_count["status"] += 1
+                status_filter = "user123/thing123/rsp/LISTEN/statusc/#"
+                if status_filter in handlers:
+                    handlers[status_filter](
+                        f"user123/thing123/rsp/LISTEN/statusc/corr{call_count['status']}",
+                        {"mode": "Normal", "millis": call_count["status"]},
+                    )
+
+        client.subscribe.side_effect = subscribe_side_effect
+        client.publish.side_effect = publish_side_effect
+
+        # First call should succeed
+        self.api.change_mode("thing123", "Normal", timeout=1)
+
+        # Second call must NOT timeout — this was the reported bug
+        self.api.change_mode("thing123", "Normal", timeout=1)
+
+        self.assertEqual(call_count["status"], 2)
+
     def test_set_output_state_invalid_value_raises(self):
         self.api.user_id = "user123"
         client = MagicMock()

@@ -6,12 +6,13 @@ and provides authenticated access to the Hydros API at https://cv.hydros.link/us
 Also supports real-time sensor data via AWS IoT MQTT.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import json
 import logging
 import requests
 import os
+import threading
 import zlib
 import base64
 import re
@@ -394,26 +395,51 @@ class MQTTClient:
             raise HydrosMQTTError(f"Failed to subscribe to {topic}: {exc}") from exc
 
     def _handle_message(self, topic: str, payload: bytes):
-        """Decode MQTT payload and dispatch to the registered callback."""
+        """Decode MQTT payload and dispatch to **all** matching callbacks.
+
+        Multiple subscriptions may overlap (e.g. a broad ``rsp/#`` from
+        :meth:`~HydrosAPI.subscribe_thing_status` alongside a specific
+        ``rsp/LISTEN/statusc/#`` from :meth:`~HydrosAPI.change_mode`).
+        Every registered callback whose filter matches the incoming topic
+        is invoked with the decoded payload.
+        """
         logger.info(f"✓ Message received on {topic}")
-        callback = self.callbacks.get(topic)
-        matched_filter = None
-        if not callback:
-            for filter_topic, candidate in self.callbacks.items():
-                if self._topic_matches(filter_topic, topic):
-                    callback = candidate
-                    matched_filter = filter_topic
-                    break
-            if callback and matched_filter and topic not in self.callbacks:
-                # Cache resolved topic for faster lookups, without altering the original filter entry
-                self.callbacks[topic] = callback
-        if not callback:
+
+        # Collect every callback that matches this topic.
+        matched: list[Callable] = []
+        seen_ids: set[int] = set()  # avoid calling the same function twice
+
+        # 1. Exact topic match (includes cached concrete-topic entries)
+        exact = self.callbacks.get(topic)
+        if exact is not None:
+            matched.append(exact)
+            seen_ids.add(id(exact))
+
+        # 2. Wildcard filter matches
+        for filter_topic, candidate in self.callbacks.items():
+            if id(candidate) in seen_ids:
+                continue
+            if filter_topic != topic and self._topic_matches(filter_topic, topic):
+                matched.append(candidate)
+                seen_ids.add(id(candidate))
+
+        if not matched:
             return
 
+        # Decode the payload once, then fan out to all matched callbacks.
+        decoded = self._decode_payload(topic, payload)
+
+        for cb in matched:
+            try:
+                cb(topic, decoded)
+            except Exception as exc:
+                logger.warning(f"⚠ Callback error on {topic}: {exc}")
+
+    def _decode_payload(self, topic: str, payload: bytes) -> Any:
+        """Decode a raw MQTT payload into a Python object for callbacks."""
         if not payload:
             logger.warning("⚠ MQTT payload empty")
-            callback(topic, {})
-            return
+            return {}
 
         header_bytes: Optional[bytes] = None
         payload_bytes = payload
@@ -437,14 +463,12 @@ class MQTTClient:
             payload_text = payload_bytes.decode("utf-8")
         except UnicodeDecodeError:
             logger.warning("⚠ MQTT payload not valid UTF-8, forwarding raw bytes")
-            callback(topic, payload_bytes)
-            return
+            return payload_bytes
 
         payload_stripped = payload_text.strip()
         if not payload_stripped:
             logger.warning("⚠ MQTT payload empty after decoding")
-            callback(topic, {})
-            return
+            return {}
 
         try:
             data = json.loads(payload_stripped)
@@ -455,13 +479,12 @@ class MQTTClient:
                         data.setdefault("_hydros_header", header_text)
                 except Exception:
                     pass
-            callback(topic, data)
+            return data
         except json.JSONDecodeError as exc:
             logger.warning(f"⚠ MQTT payload not JSON: {exc}. Forwarding raw text to callback")
             if header_bytes:
-                callback(topic, {"_hydros_header": header_bytes, "raw": payload_bytes})
-            else:
-                callback(topic, payload_text)
+                return {"_hydros_header": header_bytes, "raw": payload_bytes}
+            return payload_text
 
     def _subscribe_pending_topics(self):
         """Subscribe to any topics that were queued before the connection."""
@@ -487,6 +510,10 @@ class MQTTClient:
                 return False
 
         return len(topic_levels) == len(filter_levels)
+
+    def _unsubscribe_filter(self, topic_filter: str) -> None:
+        """Remove a one-shot subscription filter from the callbacks dict."""
+        self.callbacks.pop(topic_filter, None)
 
     def _on_connection_interrupted(self, connection, error, **kwargs):
         """Handle unexpected interruptions."""
@@ -1240,6 +1267,200 @@ class HydrosAPI:
             qos=qos,
         )
 
+    _ACK_STATUS_RE = re.compile(r"^\s*(\d{3})\b")
+
+    @staticmethod
+    def _extract_ack_status(payload: Any) -> Optional[int]:
+        """Extract an HTTP-like status code from a Hydros MQTT ack payload.
+
+        The Hydros controller replies with payloads like ``"200 "`` on success.
+        This helper normalises the various payload shapes the MQTT layer may
+        deliver (raw ``str``, ``bytes``, ``int``, or ``dict``) into an
+        ``Optional[int]`` status code.
+        """
+        if isinstance(payload, int):
+            return payload
+
+        text: Optional[str] = None
+        if isinstance(payload, (bytes, bytearray)):
+            text = payload.decode("utf-8", errors="ignore")
+        elif isinstance(payload, str):
+            text = payload
+
+        if text is not None:
+            match = HydrosAPI._ACK_STATUS_RE.search(text)
+            return int(match.group(1)) if match else None
+
+        if isinstance(payload, dict):
+            for key in ("status", "code", "statusCode"):
+                value = payload.get(key)
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str) and value.strip().isdigit():
+                    return int(value.strip())
+            # One level of nesting only to avoid unbounded recursion
+            raw = payload.get("raw")
+            if raw is not None and not isinstance(raw, dict):
+                return HydrosAPI._extract_ack_status(raw)
+
+        return None
+
+    def change_mode(
+        self,
+        thing_id: str,
+        mode: str,
+        *,
+        timeout: float = 10.0,
+        client_id: str = "pyhydros",
+        qos: awscrt_mqtt.QoS = awscrt_mqtt.QoS.AT_LEAST_ONCE,
+    ) -> None:
+        """Change the operating mode of a Hydros controller.
+
+        Publishes a ``PUT/Mode/<mode>`` command, waits for the controller
+        acknowledgement, validates a ``200`` success status, then requests a
+        status refresh and **verifies that the controller actually switched
+        to the requested mode** by inspecting the ``mode`` field in the
+        status response.
+
+        .. note::
+
+           The Hydros controller returns ``200`` for *any* mode-change
+           request — even for invalid mode names.  The ``200`` only confirms
+           that the message was received, **not** that the mode was applied.
+           The status-response verification (step 4) is therefore the
+           authoritative check.
+
+        The full MQTT exchange (mirroring the official app) is:
+
+        1. **Send** ``req/PUT/Mode/<mode>`` — empty payload.
+        2. **Receive** ``rsp/PUT/Mode/<mode>/<correlation_id>`` — ``"200 "``
+           confirming receipt.
+        3. **Send** ``req/LISTEN/statusc`` — triggers a status update.
+        4. **Receive** ``rsp/LISTEN/statusc/<correlation_id>`` — zlib-compressed
+           JSON status.  The ``"mode"`` key in the response is compared
+           against the requested *mode* to confirm the change took effect.
+
+        Args:
+            thing_id: The Hydros thing ID to send the command to.
+            mode: Target mode name (e.g. ``"Normal"``, ``"Feeding"``,
+                ``"Water Change"``).
+            timeout: Seconds to wait for **each** wait stage — the command
+                acknowledgement and the status confirmation (default 10).
+            client_id: MQTT client ID used when opening a new connection.
+            qos: MQTT QoS level for the published commands.
+
+        Raises:
+            ValueError: If *mode* is empty or *thing_id* is missing.
+            HydrosMQTTError: If any wait stage times out, the receipt is
+                non-200, the status response reports a different mode, or
+                the user is not authenticated.
+        """
+        mode_token = str(mode or "").strip()
+        if not mode_token:
+            raise ValueError("mode must be a non-empty string")
+
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+
+        if not self.user_id:
+            raise HydrosMQTTError("User ID not available. Call authenticate() first.")
+
+        self._ensure_mqtt_connected(thing_id, client_id=client_id)
+        if not self.mqtt_client or not getattr(self.mqtt_client, "connected", False):
+            raise HydrosMQTTError("MQTT client is not connected")
+
+        # Subscribe before publishing so we don't miss the acknowledgement
+        ack_event = threading.Event()
+        ack_state: Dict[str, Any] = {"status": None, "topic": None, "payload": None}
+        response_filter = f"{self.user_id}/{thing_id}/rsp/PUT/Mode/{mode_token}/#"
+
+        def _ack_handler(topic: str, payload: Any) -> None:
+            ack_state["status"] = self._extract_ack_status(payload)
+            ack_state["topic"] = topic
+            ack_state["payload"] = payload
+            ack_event.set()
+
+        self.mqtt_client.subscribe(response_filter, _ack_handler)
+        logger.info(f"Subscribed for mode-change ack on {response_filter}")
+
+        try:
+            # Publish the mode change command (empty payload matches the official app)
+            request_topic = f"{self.user_id}/{thing_id}/req/PUT/Mode/{mode_token}"
+            logger.info(f"Changing mode to '{mode_token}' on {thing_id}")
+            self.mqtt_client.publish(request_topic, payload=None, qos=qos)
+
+            # Mandatory acknowledgement: wait and require HTTP-like 200 success
+            if not ack_event.wait(timeout=float(timeout)):
+                raise HydrosMQTTError(
+                    f"Timed out waiting for mode-change acknowledgement "
+                    f"(mode='{mode_token}', timeout={timeout}s)"
+                )
+
+            ack_status = ack_state.get("status")
+            if ack_status != 200:
+                raise HydrosMQTTError(
+                    f"Mode change failed for mode '{mode_token}': "
+                    f"controller returned status {ack_status!r}"
+                )
+
+            # Verify the mode actually changed via a status refresh 
+            # (because 200 actually is returned even when an invalid mode is requested).
+            # Subscribe to the status response topic (same pattern as the
+            # ack handler above).  By the time the callback fires,
+            # ``_handle_message`` has already decompressed and JSON-parsed
+            # the payload, so we receive a plain ``dict``.
+            status_event = threading.Event()
+            status_container: Dict[str, Any] = {"mode": None}
+            status_filter = (
+                f"{self.user_id}/{thing_id}/rsp/LISTEN/statusc/#"
+            )
+
+            def _status_handler(topic: str, payload: Any) -> None:
+                if isinstance(payload, dict):
+                    status_container["mode"] = payload.get("mode")
+                status_event.set()
+
+            self.mqtt_client.subscribe(status_filter, _status_handler)
+            logger.info(
+                f"Subscribed for status verification on {status_filter}"
+            )
+
+            try:
+                status_topic = (
+                    f"{self.user_id}/{thing_id}/req/LISTEN/statusc"
+                )
+                self.mqtt_client.publish(
+                    status_topic, payload=b"", qos=qos
+                )
+                logger.info(
+                    "Requested status refresh after mode change"
+                )
+
+                if not status_event.wait(timeout=float(timeout)):
+                    raise HydrosMQTTError(
+                        f"Timed out waiting for status confirmation "
+                        f"after mode change "
+                        f"(mode='{mode_token}', timeout={timeout}s)"
+                    )
+
+                current_mode = status_container.get("mode")
+                if current_mode != mode_token:
+                    raise HydrosMQTTError(
+                        f"Mode verification failed: requested "
+                        f"'{mode_token}' but controller reports "
+                        f"'{current_mode}'"
+                    )
+
+                logger.info(
+                    f"Mode verified: controller is now in "
+                    f"'{current_mode}'"
+                )
+            finally:
+                self.mqtt_client._unsubscribe_filter(status_filter)
+        finally:
+            # Remove the one-shot ack subscription so it doesn't accumulate
+            self.mqtt_client._unsubscribe_filter(response_filter)
+
     def _coerce_output_state(self, state: Union[int, str]) -> int:
         """Normalize textual output states to their numeric representation."""
         if isinstance(state, int):
@@ -1299,7 +1520,7 @@ if __name__ == "__main__":
 
     thing_id = collective_thing.get('thingName', collective_thing.get('id', 'Unknown'))
     logger.info(f"3. Using thing: {thing_id}\n")
-    
+ 
     # Show hydros configuration
     logger.info("4. Hydros Configuration:")
     logger.info("-" * 60)
@@ -1318,6 +1539,9 @@ if __name__ == "__main__":
             
     except Exception as e:
         logger.error(f"✗ Could not fetch S3 data: {e}")
+ 
+    # Change mode to Normal (example command)
+    #client.change_mode(thing_id, "Normal")
 
     # Example get doser logs
     # local_now = datetime.now().astimezone()
@@ -1363,7 +1587,7 @@ if __name__ == "__main__":
         logger.info("\nListening for MQTT messages (5 seconds)...")
         logger.info("=" * 60)
         
-        for i in range(5):
+        for i in range(30):
             time.sleep(1)
             if (i + 1) % 10 == 0:
                 logger.info(f"[{i + 1}s] Still listening...")
