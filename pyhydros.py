@@ -6,13 +6,14 @@ and provides authenticated access to the Hydros API at https://cv.hydros.link/us
 Also supports real-time sensor data via AWS IoT MQTT.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 import json
 import logging
 import requests
 import os
 import threading
+import time
 import zlib
 import base64
 import re
@@ -1339,6 +1340,9 @@ class HydrosAPI:
         4. **Receive** ``rsp/LISTEN/statusc/<correlation_id>`` — zlib-compressed
            JSON status.  The ``"mode"`` key in the response is compared
            against the requested *mode* to confirm the change took effect.
+           If the first response still shows the old mode (the controller
+           hasn't finished switching yet), the status request is re-sent
+           and checked again until the mode matches or the timeout expires.
 
         Args:
             thing_id: The Hydros thing ID to send the command to.
@@ -1409,6 +1413,12 @@ class HydrosAPI:
             # ack handler above).  By the time the callback fires,
             # ``_handle_message`` has already decompressed and JSON-parsed
             # the payload, so we receive a plain ``dict``.
+            #
+            # The controller may reply with a stale mode on the first
+            # status response (the switch hasn't completed yet).  We
+            # keep re-requesting a status refresh and checking each
+            # response until either the mode matches or the timeout
+            # expires.
             status_event = threading.Event()
             status_container: Dict[str, Any] = {"mode": None}
             status_filter = (
@@ -1429,32 +1439,40 @@ class HydrosAPI:
                 status_topic = (
                     f"{self.user_id}/{thing_id}/req/LISTEN/statusc"
                 )
-                self.mqtt_client.publish(
-                    status_topic, payload=b"", qos=qos
-                )
-                logger.info(
-                    "Requested status refresh after mode change"
-                )
+                deadline = time.monotonic() + float(timeout)
 
-                if not status_event.wait(timeout=float(timeout)):
-                    raise HydrosMQTTError(
-                        f"Timed out waiting for status confirmation "
-                        f"after mode change "
-                        f"(mode='{mode_token}', timeout={timeout}s)"
+                while True:
+                    status_event.clear()
+                    self.mqtt_client.publish(
+                        status_topic, payload=b"", qos=qos
+                    )
+                    logger.info(
+                        "Requested status refresh after mode change"
                     )
 
-                current_mode = status_container.get("mode")
-                if current_mode != mode_token:
-                    raise HydrosMQTTError(
-                        f"Mode verification failed: requested "
-                        f"'{mode_token}' but controller reports "
-                        f"'{current_mode}'"
-                    )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not status_event.wait(
+                        timeout=remaining
+                    ):
+                        raise HydrosMQTTError(
+                            f"Timed out waiting for status confirmation "
+                            f"after mode change "
+                            f"(mode='{mode_token}', timeout={timeout}s)"
+                        )
 
-                logger.info(
-                    f"Mode verified: controller is now in "
-                    f"'{current_mode}'"
-                )
+                    current_mode = status_container.get("mode")
+                    if current_mode == mode_token:
+                        logger.info(
+                            f"Mode verified: controller is now in "
+                            f"'{current_mode}'"
+                        )
+                        break
+
+                    logger.debug(
+                        f"Status shows '{current_mode}', expected "
+                        f"'{mode_token}' — retrying until timeout"
+                    )
+                    time.sleep(0.5)
             finally:
                 self.mqtt_client._unsubscribe_filter(status_filter)
         finally:
@@ -1542,6 +1560,7 @@ if __name__ == "__main__":
  
     # Change mode to Normal (example command)
     #client.change_mode(thing_id, "Normal")
+    client.change_mode(thing_id, "Invalid")
 
     # Example get doser logs
     # local_now = datetime.now().astimezone()

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-07
+
+### Fixed
+
+- `change_mode()` now retries status verification until the timeout expires
+  instead of failing on the first stale response. The controller often replies
+  with the old mode before the switch completes, which previously caused a
+  false "Mode verification failed" error.
+
 ## [0.4.0] - 2026-04-05
 
 ### Added

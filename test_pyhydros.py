@@ -462,7 +462,7 @@ class TestHydrosAPI(unittest.TestCase):
         )
 
     def test_change_mode_raises_on_mode_mismatch(self):
-        """If the status response reports a different mode, raise HydrosMQTTError."""
+        """If the status never reports the right mode, time out."""
         client = self._setup_mqtt()
         handlers: dict = {}
 
@@ -485,11 +485,9 @@ class TestHydrosAPI(unittest.TestCase):
         client.publish.side_effect = publish_side_effect
 
         with self.assertRaises(HydrosMQTTError) as ctx:
-            self.api.change_mode("thing123", "Feeding", timeout=1)
+            self.api.change_mode("thing123", "Feeding", timeout=0.05)
 
-        self.assertIn("Mode verification failed", str(ctx.exception))
-        self.assertIn("Feeding", str(ctx.exception))
-        self.assertIn("Normal", str(ctx.exception))
+        self.assertIn("Timed out waiting for status confirmation", str(ctx.exception))
 
     def test_change_mode_raises_on_status_timeout(self):
         """If no status response arrives, raise HydrosMQTTError."""
@@ -544,7 +542,7 @@ class TestHydrosAPI(unittest.TestCase):
         client.publish.side_effect = publish_side_effect
 
         with self.assertRaises(HydrosMQTTError):
-            self.api.change_mode("thing123", "Feeding", timeout=1)
+            self.api.change_mode("thing123", "Feeding", timeout=0.05)
 
         # Both one-shot subscriptions must have been cleaned up
         self.assertNotIn(
